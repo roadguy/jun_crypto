@@ -1,0 +1,10 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pandas==2.3.1
+numpy==2.2.6
+ccxt==4.4.96
+joblib==1.5.1
+filelock==3.18.0
+scikit-learn==1.7.1
+xgboost==3.0.4
+requests==2.32.5

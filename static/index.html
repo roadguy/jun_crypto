@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="description" content="종료된 OHLCV 캔들로 다음 캔들의 상승·하락 확률을 연구하는 XGBoost 포트폴리오">
+  <meta name="theme-color" content="#080d12">
+  <title>Signal Ledger · 암호화폐 방향 예측</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="예측 설정">
+      <div class="side-brand"><span>/</span> SIGNAL LEDGER</div>
+      <button class="icon-button side-close" id="closeSidebar" aria-label="설정 닫기">×</button>
+
+      <section class="control-section">
+        <p class="eyebrow">PREDICTION SETUP</p>
+        <h2>예측 설정</h2>
+        <label for="token">코인 이름</label>
+        <input id="token" value="BTC" maxlength="30" autocomplete="off" spellcheck="false" aria-describedby="tokenHelp">
+        <small id="tokenHelp">예: BTC, ETH, SOL, XRP</small>
+
+        <label for="timeframe">시간봉</label>
+        <select id="timeframe">
+          <option value="15m">15분</option>
+          <option value="1h">1시간</option>
+          <option value="4h" selected>4시간</option>
+          <option value="1d">1일</option>
+        </select>
+
+        <button class="button primary" data-action="predict">최신 예측 확인</button>
+        <button class="button secondary" data-action="refresh">데이터 새로고침</button>
+      </section>
+
+      <details class="advanced">
+        <summary>고급 연구·검증</summary>
+        <p>포트폴리오용 검증 자료를 다시 만들 때만 사용합니다. 오래 걸릴 수 있습니다.</p>
+        <label class="check"><input type="checkbox" id="noiseTest"><span>과적합 검사 포함</span></label>
+        <button class="button secondary" data-action="validate">개발구간 백테스트·검증</button>
+        <label class="check"><input type="checkbox" id="lockboxConfirm"><span>연구 기준을 모두 확정했습니다</span></label>
+        <button class="button danger" data-action="lockbox">최종 미공개 데이터 검증</button>
+      </details>
+
+      <p class="side-note">페이지를 여는 것만으로 학습이나 검증은 시작되지 않습니다. 실제 주문 기능은 없습니다.</p>
+    </aside>
+
+    <button class="sidebar-toggle" id="openSidebar" aria-label="예측 설정 열기"><span>☰</span> 설정</button>
+    <div class="backdrop" id="backdrop"></div>
+
+    <main>
+      <header class="masthead">
+        <div class="masthead-top">
+          <div class="wordmark"><span>/</span> SIGNAL LEDGER</div>
+          <div class="build-tag">MODEL A · RESEARCH BUILD</div>
+        </div>
+        <div class="hero-row">
+          <div>
+            <p class="eyebrow">NEXT CANDLE PROBABILITY</p>
+            <h1>암호화폐 방향<br>예측 시스템</h1>
+            <p class="lede">종료된 캔들만 사용해 다음 캔들의 상승·하락 확률과 예상 가격 구간을 계산합니다.</p>
+          </div>
+          <div class="selection-badge"><b id="badgeToken">BTCUSDT</b><span id="badgeTimeframe">4H</span></div>
+        </div>
+      </header>
+
+      <section class="status-panel" id="statusPanel" aria-live="polite">
+        <div class="status-dot"></div>
+        <div><b id="statusTitle">분석할 준비가 되었습니다</b><p id="statusMessage">왼쪽 설정에서 코인과 시간봉을 고른 뒤 ‘최신 예측 확인’을 누르세요.</p></div>
+        <div class="spinner" id="spinner" aria-hidden="true"></div>
+      </section>
+
+      <section class="chart-card">
+        <div class="section-heading">
+          <div><p class="eyebrow">MARKET STRUCTURE</p><h2>가격 차트</h2></div>
+          <div class="legend"><span class="ema50">EMA 50</span><span class="ema200">EMA 200</span><span class="bb">볼린저 밴드</span></div>
+        </div>
+        <div id="chart" class="chart" role="img" aria-label="캔들 가격 차트"></div>
+        <div class="chart-empty" id="chartEmpty"><b>아직 저장된 캔들이 없습니다</b><span>예측이나 새로고침을 실행하면 최근 종료 캔들 최대 2,000개가 표시됩니다.</span></div>
+        <button class="button secondary" id="allCandles">전체 저장 캔들 보기</button>
+        <p class="hint">기본 최근 2,000봉 · 마우스 휠: 확대·축소 · 드래그: 좌우 이동 · 더블클릭: 최근 구간으로 돌아오기</p>
+      </section>
+
+      <section class="prediction-section" id="predictionSection">
+        <div class="section-heading">
+          <div><p class="eyebrow">MODEL OUTPUT</p><h2>다음 1봉 예측</h2></div>
+          <span class="signal neutral" id="signalBadge">WAITING</span>
+        </div>
+        <div class="metric-grid top-metrics">
+          <article class="metric"><span>기준 종가</span><strong id="referenceClose">—</strong><small>USDT</small></article>
+          <article class="metric"><span>상승 확률</span><strong id="upProbability">—</strong><small>UP</small></article>
+          <article class="metric"><span>하락 확률</span><strong id="downProbability">—</strong><small>DOWN</small></article>
+          <article class="metric"><span>신호 기준 확률</span><strong id="threshold">—</strong><small>MODEL THRESHOLD</small></article>
+        </div>
+        <div class="probability-track" aria-label="상승 하락 확률">
+          <div class="up-fill" id="upFill"></div><div class="probability-center"></div>
+        </div>
+        <div class="probability-labels"><span>하락 <b id="downMini">—</b></span><span>상승 <b id="upMini">—</b></span></div>
+        <div class="prediction-meta" id="predictionMeta">예측을 실행하면 기준 캔들과 예측 대상 시간이 표시됩니다.</div>
+      </section>
+
+      <section class="insight-grid">
+        <article class="insight-card direction-card">
+          <p class="eyebrow">DIRECTION INDEX</p>
+          <h2>방향 확률 지수</h2>
+          <div class="gauge" id="gauge"><div class="gauge-cover"></div><div class="needle" id="needle"></div></div>
+          <div class="gauge-value"><strong id="gaugeValue">—</strong><span id="gaugeSignal">대기 중</span></div>
+          <p id="directionExplanation">상승확률이 신호 기준보다 높으면 LONG, 하락 쪽 기준보다 낮으면 SHORT, 그 사이는 NEUTRAL입니다.</p>
+        </article>
+
+        <article class="insight-card range-card">
+          <p class="eyebrow">CONDITIONAL RANGE</p>
+          <h2>다음 1봉 예상 가격 구간</h2>
+          <div class="range-table">
+            <div class="range-head"><span>구간</span><span>예상 가격</span><span>종가 대비</span></div>
+            <div class="range-row"><span>하단 <small>Q10</small></span><strong id="q10Price">—</strong><b id="q10Return">—</b></div>
+            <div class="range-row focus"><span>중앙 <small>Q50</small></span><strong id="q50Price">—</strong><b id="q50Return">—</b></div>
+            <div class="range-row"><span>상단 <small>Q90</small></span><strong id="q90Price">—</strong><b id="q90Return">—</b></div>
+          </div>
+          <div class="quality-row"><span>Q10~Q90 포함률 <b id="coverage">—</b></span><span>Pinball Skill <b id="pinball">—</b></span></div>
+          <p class="hint">목표가·손절가가 아니라 모델이 예상한 범위입니다. 범위 밖 가격도 나올 수 있습니다.</p>
+        </article>
+      </section>
+
+      <section class="validation-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">OUT-OF-SAMPLE</p><h2>모델 신뢰도</h2></div>
+          <span class="quality-badge" id="overfitStatus">검증 결과 없음</span>
+        </div>
+        <div class="metric-grid compact" id="validationMetrics">
+          <article class="metric"><span>ROC-AUC</span><strong id="rocAuc">—</strong><small>0.5보다 높을수록 구분력 있음</small></article>
+          <article class="metric"><span>Brier Score</span><strong id="brier">—</strong><small>낮을수록 확률이 정확함</small></article>
+          <article class="metric"><span>Train–OOS 격차</span><strong id="gap">—</strong><small>작을수록 일반화가 안정적</small></article>
+          <article class="metric"><span>Fold 표준편차</span><strong id="foldStd">—</strong><small>작을수록 구간별 결과가 고름</small></article>
+          <article class="metric"><span>OOS 표본</span><strong id="oosSamples">—</strong><small>모델이 못 본 검증 데이터</small></article>
+          <article class="metric"><span>Fold 수</span><strong id="foldCount">—</strong><small>시간순 모의시험 횟수</small></article>
+        </div>
+      </section>
+
+      <section class="strategy-section">
+        <div class="section-heading"><div><p class="eyebrow">SIMULATED STRATEGY</p><h2>비용 반영 모의 성과</h2></div><span class="leverage-tag">3× LEVERAGE</span></div>
+        <div class="metric-grid compact">
+          <article class="metric"><span>종료 거래</span><strong id="trades">—</strong></article>
+          <article class="metric"><span>승률</span><strong id="winRate">—</strong></article>
+          <article class="metric"><span>누적수익률</span><strong id="return">—</strong></article>
+          <article class="metric"><span>최대 낙폭 MDD</span><strong id="mdd">—</strong></article>
+          <article class="metric"><span>Profit Factor</span><strong id="profitFactor">—</strong></article>
+          <article class="metric"><span>Sharpe</span><strong id="sharpe">—</strong></article>
+        </div>
+        <div class="warning">과거 OOS 모의검증 결과입니다. 펀딩비는 포함하지 않았고, 높은 수익률도 미래 수익을 보장하지 않습니다.</div>
+      </section>
+
+      <section class="features-section">
+        <div class="section-heading"><div><p class="eyebrow">WHAT THE MODEL SEES</p><h2>모델이 보는 22가지 정보</h2></div><span class="count-badge">22 FEATURES</span></div>
+        <p class="section-copy">사람이 차트를 볼 때 가격·캔들·거래량을 함께 보는 것처럼, 모델도 아래 숫자들을 한꺼번에 보고 비슷한 과거 상황을 찾습니다.</p>
+        <div class="feature-grid" id="featureGrid"></div>
+      </section>
+
+      <details class="log-panel">
+        <summary>최근 실행 기록 보기</summary>
+        <pre id="operationLog">아직 실행 기록이 없습니다.</pre>
+      </details>
+
+      <footer>
+        <div><b>SIGNAL LEDGER</b><span>Research portfolio · Model A</span></div>
+        <p>연구 및 모의검증 용도입니다. 실제 주문 기능은 없으며, 비용 반영 전략 성과는 3배 레버리지 기준입니다. 표시된 확률과 과거 성과는 미래 결과를 보장하지 않습니다.</p>
+      <p><a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">Charts by TradingView Lightweight Charts™</a></p>
+      </footer>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/static/lightweight-charts.js"></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
