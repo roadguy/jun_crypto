@@ -31,7 +31,28 @@ LOCKBOX_DAYS = 90
 MIN_RUIN_TRADES = 300
 BOOTSTRAP_REPEATS = 300
 NOISE_REPEATS = 3
-DIAGNOSTIC_VERSION = "portfolio_diagnostics_v1"
+DIAGNOSTIC_VERSION = "portfolio_diagnostics_v2"
+
+
+def _cached_lockbox_result(existing: dict) -> dict[str, Any]:
+    """구버전 평가를 현재 성과로 표시하거나 자동 재평가하지 않는다."""
+    if (
+        existing.get("model_version") == core.MODEL_VERSION
+        and existing.get("diagnostic_version") == DIAGNOSTIC_VERSION
+        and existing.get("feature_columns") == list(core.FEATURE_COLUMNS)
+    ):
+        return existing
+    return {
+        "status": "OUTDATED_DIAGNOSTICS",
+        "evaluated_at": existing.get("evaluated_at"),
+        "model_version": existing.get("model_version"),
+        "diagnostic_version": existing.get("diagnostic_version"),
+        "current_diagnostic_version": DIAGNOSTIC_VERSION,
+        "warning": (
+            "저장된 최종 평가는 이전 모델 또는 계산 기준의 결과입니다. "
+            "성과 수치를 숨기고 기존 파일을 보존했습니다. 자동 재평가하지 않았습니다."
+        ),
+    }
 
 
 def _safe_metrics(y_true, probability) -> dict[str, float]:
@@ -50,7 +71,7 @@ def split_development_lockbox(
     ordered = model_df.sort_values("timestamp").reset_index(drop=True)
     cutoff = ordered["timestamp"].iloc[-1] - pd.Timedelta(days=lockbox_days)
     lockbox_start = int(ordered["timestamp"].searchsorted(cutoff, side="left"))
-    development_end = lockbox_start - core.PURGE_BARS
+    development_end = max(0, lockbox_start - core.PURGE_BARS)
     development = ordered.iloc[:development_end].copy()
     lockbox = ordered.iloc[lockbox_start:].copy()
     if len(development) < 400 or len(lockbox) < 30:
@@ -121,7 +142,7 @@ def _baseline_probabilities(
     logistic = Pipeline(
         [
             ("scale", RobustScaler()),
-            ("model", LogisticRegression(C=0.01, l1_ratio=0.0, max_iter=2000,
+            ("model", LogisticRegression(C=0.01, max_iter=2000,
                                           random_state=core.RANDOM_STATE)),
         ]
     )
@@ -300,7 +321,13 @@ def _simulate_fixed_position_strategy(
     trade_returns: list[float] = []
     total_fee_amount = 0.0
     index = 0
+    if ordered.empty:
+        raise ValueError("백테스트할 예측 기록이 없습니다.")
     while index < len(ordered):
+        if equity <= 0:
+            equity_curve[index:] = 0.0
+            position[index:] = 0
+            break
         direction = int(position[index])
         if direction == 0:
             equity_curve[index] = equity
@@ -326,6 +353,10 @@ def _simulate_fixed_position_strategy(
                 total_fee_amount += exit_fee
                 marked_equity -= exit_fee
             equity_curve[bar] = max(0.0, marked_equity)
+            # 잔고가 소진되면 이후 가격 반등으로 포지션이 되살아나지 않는다.
+            if marked_equity <= 0:
+                end = bar + 1
+                break
         equity = float(equity_curve[end - 1])
         trade_returns.append(equity / equity_before - 1 if equity_before > 0 else -1.0)
         index = end
@@ -539,11 +570,11 @@ def _run_walk_forward_impl(symbol: str, timeframe: str, refresh: bool,
                 existing_lockbox = json.load(file)
         except (OSError, json.JSONDecodeError):
             pass
-    lockbox_status = (existing_lockbox if existing_lockbox and
-                      existing_lockbox.get("model_version") == core.MODEL_VERSION and
-                      existing_lockbox.get("diagnostic_version") == DIAGNOSTIC_VERSION and
-                      existing_lockbox.get("feature_columns") == list(core.FEATURE_COLUMNS)
-                      else {"status": "RESERVED_NOT_EVALUATED", **lockbox_meta})
+    lockbox_status = (
+        _cached_lockbox_result(existing_lockbox)
+        if existing_lockbox is not None
+        else {"status": "RESERVED_NOT_EVALUATED", **lockbox_meta}
+    )
     summary = {
         "model_name": core.MODEL_NAME, "model_version": core.MODEL_VERSION,
         "feature_columns": list(core.FEATURE_COLUMNS), "diagnostic_version": DIAGNOSTIC_VERSION,
@@ -601,9 +632,7 @@ def evaluate_lockbox_once(symbol: str, timeframe: str, refresh: bool = False,
             if paths.lockbox_summary.exists() and not force:
                 with paths.lockbox_summary.open(encoding="utf-8") as file:
                     existing = json.load(file)
-                if (existing.get("model_version") == core.MODEL_VERSION and
-                        existing.get("feature_columns") == list(core.FEATURE_COLUMNS)):
-                    return existing
+                return _cached_lockbox_result(existing)
             raw, _, model_df = core.prepare_data(symbol, timeframe, refresh=refresh)
             development, lockbox, lockbox_meta = split_development_lockbox(model_df)
             artifact = core.fit_operational_artifact(

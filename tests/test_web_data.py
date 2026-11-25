@@ -4,14 +4,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, Mock
 
-import ccxt
 import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
 import app
 import crypto_xgb_core as core
-from market_data import BinancePublicData
+from market_data import BinancePublicData, TransientDataError
 
 
 class IsolatedTest(unittest.TestCase):
@@ -20,6 +19,7 @@ class IsolatedTest(unittest.TestCase):
         self.env = patch.dict(os.environ, CRYPTO_XGB_DATA_ROOT=self.tmp.name)
         self.env.start()
         self.client = TestClient(app.app)
+        self.addCleanup(self.client.close)
     def tearDown(self):
         self.env.stop()
         self.tmp.cleanup()
@@ -41,6 +41,7 @@ class APITests(IsolatedTest):
             response = self.client.get('/api/snapshot')
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()['has_data'])
+        self.assertIsNone(response.json()['validation_summary'])
     def test_chart_missing(self):
         self.assertEqual(self.client.get('/api/chart').status_code, 404)
     def test_chart_bounded_and_ema_keeps_history(self):
@@ -78,6 +79,26 @@ class APITests(IsolatedTest):
         self.assertEqual(second.status_code, 409)
         app.JOBS.pop(first.json()['job_id'])
 
+    def test_submission_failure_does_not_leave_queued_job(self):
+        before = set(app.JOBS)
+        with patch.object(app.EXECUTOR, 'submit', side_effect=RuntimeError('shutdown')):
+            response = self.client.post('/api/jobs', json={'action': 'refresh'})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(set(app.JOBS), before)
+
+    def test_outdated_lockbox_returns_warning_instead_of_new_evaluation_message(self):
+        job_id = 'outdated-lockbox-test'
+        app.JOBS[job_id] = {'status': 'queued', 'log': ''}
+        self.addCleanup(app.JOBS.pop, job_id, None)
+        result = {'status': 'OUTDATED_DIAGNOSTICS', 'warning': '이전 계산 기준의 결과입니다.'}
+        with patch.object(app.validation, 'evaluate_lockbox_once', return_value=result), \
+             patch.object(app, '_read_snapshot', return_value={}):
+            app._execute_job(job_id, app.JobRequest(action='lockbox', confirm_lockbox=True))
+        job = app.JOBS[job_id]
+        self.assertEqual(job['status'], 'complete')
+        self.assertIn('구버전', job['message'])
+        self.assertEqual(job['result']['warnings'], [result['warning']])
+
 
 class DataTests(IsolatedTest):
     def test_latest_cache_needs_no_market_request(self):
@@ -103,7 +124,7 @@ class DataTests(IsolatedTest):
             with self.assertRaises(ValueError): core.validate_ohlcv(raw, '4h')
     def test_timeout_retries_are_bounded(self):
         exchange = Mock()
-        exchange.fetch_ohlcv.side_effect = ccxt.RequestTimeout('timeout')
+        exchange.fetch_ohlcv.side_effect = TransientDataError('timeout')
         with patch.object(core.time, 'sleep'), self.assertRaises(RuntimeError):
             core._fetch_page_with_retry(exchange, 'BTC/USDT:USDT', '4h', 0)
         self.assertEqual(exchange.fetch_ohlcv.call_count, 3)

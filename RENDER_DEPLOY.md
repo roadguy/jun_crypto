@@ -1,68 +1,40 @@
-# Render 배포 안내
+# Render 배포 설정
 
-## 가장 간단한 방법: Blueprint
+이 저장소의 `render.yaml`은 FastAPI 서버를 실행하는 설정입니다. HTML 파일만 올리는 정적 호스팅으로는 모델을 실행할 수 없습니다.
 
-1. 압축을 풀고 `crypto_html_site_fixed` **폴더 안의 파일들**을 GitHub 저장소 최상단에 올립니다. `app.py`, `requirements.txt`, `render.yaml`, `static/`이 같은 위치에 있어야 합니다.
-2. Render에서 **New → Blueprint**를 선택하고 해당 저장소를 연결합니다.
-3. `render.yaml`에 정의된 Python Web Service를 확인한 뒤 생성합니다. 기본 파일은 Free 요금제로 설정했습니다.
-4. 배포가 완료되면 Render의 `https://…onrender.com` 주소를 엽니다.
-5. `데이터 새로고침`으로 실제 거래소 연결부터 확인한 뒤 `최신 예측 확인`을 실행합니다.
+## 저장소 연결
 
-`.venv`, `__pycache__`, 기존 학습 모델은 올리지 않습니다. `static/`만 따로 배포하지 마세요.
+1. Render에서 저장소를 연결해 Blueprint를 생성합니다.
+2. `render.yaml`의 서비스 설정을 확인합니다.
+3. 배포 후 서비스 주소를 열고 **데이터 새로고침**으로 Binance 연결을 확인합니다.
+4. 데이터 수집에 성공하면 **최신 예측 확인**을 실행합니다.
 
-## 기존 서비스를 직접 설정할 때
+수동으로 Web Service를 만들 때는 다음 값을 사용합니다.
 
 | 항목 | 값 |
-|---|---|
-| Service type | Web Service |
-| Runtime | Python 3 |
-| Region | Singapore |
-| Root Directory | 파일을 저장소 최상단에 올렸으면 비움 |
+| --- | --- |
+| Root Directory | 저장소 최상단 |
 | Build Command | `python -m pip install -r requirements.txt` |
 | Start Command | `python -m uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1` |
 | Health Check Path | `/api/health` |
 
-저장소 안에 `crypto_html_site_fixed` 폴더째 올렸다면 Root Directory를 `crypto_html_site_fixed`로 지정합니다.
-Blueprint 방식은 저장소 최상단에 파일을 두는 구성을 기준으로 작성했습니다.
+`PORT`는 호스팅 환경에서 제공합니다. Python 버전과 수치 연산 스레드 설정은 `render.yaml`을 기준으로 맞춥니다. 로컬용 `start.command`는 배포 시작 명령으로 사용하지 않습니다.
 
-환경변수:
+## 데이터와 작업 상태
 
-```text
-PYTHON_VERSION=3.12.8
-PYTHONUNBUFFERED=1
-OMP_NUM_THREADS=1
-OPENBLAS_NUM_THREADS=1
-MKL_NUM_THREADS=1
-NUMEXPR_NUM_THREADS=1
-CRYPTO_XGB_DATA_ROOT=./data
-```
+CSV와 모델은 `CRYPTO_XGB_DATA_ROOT`에 저장합니다. 현재 설정은 `./data`입니다. 재시작 후에도 보존하려면 영구 저장소를 연결하고 그 경로를 환경변수에 지정해야 합니다.
 
-`PORT`는 Render가 제공합니다. API 키는 필요하지 않습니다.
-기존 서비스에 다른 PYTHON_VERSION이 설정되어 있으면 변경하세요.
-로컬 실행용 `start.command`는 Render 시작 명령으로 사용하지 않습니다.
+작업 상태는 프로세스 메모리에 있어 **worker를 1개로 실행**합니다. 서버가 재시작되면 진행 중 작업 정보는 사라집니다. 저장된 다운로드 체크포인트가 있으면 수집을 이어갈 수 있습니다.
 
-## 저장 데이터 유지
-
-Free 서비스는 영구 디스크를 사용할 수 없습니다. 재배포·재시작 시 모델과 CSV가 사라져 다시 수집·학습할 수 있습니다.
-상시 운영하며 데이터를 유지하려면 디스크를 지원하는 유료 서비스에서 디스크를 추가하고, 예를 들어 `/var/data`에 마운트한 뒤 다음 환경변수를 지정합니다.
-
-```text
-CRYPTO_XGB_DATA_ROOT=/var/data/crypto_xgb
-```
-
-현재 render.yaml에는 유료 서비스나 유료 디스크를 자동 생성하는 설정을 넣지 않았습니다.
-무료 인스턴스에서 장시간 검증·학습의 메모리 한도 내 동작을 보장하지 않습니다. 메모리 부족으로 프로세스가 종료되면 인스턴스 메모리를 늘리거나 검증은 로컬에서 실행하세요.
+장시간 학습과 검증은 메모리를 많이 사용할 수 있습니다. 배포 설정 파일이 있다는 것만으로 해당 서버에서 학습이나 거래소 접근에 성공했다는 뜻은 아닙니다.
 
 ## 배포 후 확인
 
-- `/api/health`의 `status: ok`는 앱 실행 확인입니다. Binance 연결 성공까지 뜻하지는 않습니다.
-- `데이터 새로고침`의 완료 메시지와 차트를 확인합니다.
-- 403/451이면 해당 Render 서버 IP·지역의 Binance 접근 제한입니다. Singapore도 성공을 보장하지 않습니다.
-- 429/418이면 화면에 표시된 대기 시간을 확인합니다.
-- `ModuleNotFoundError`이면 Root Directory·Build Command·설치 로그를 확인합니다.
-- `No open ports detected`이면 위 Start Command와 `$PORT` 설정을 확인합니다.
-- 모델 계산 중 서버가 재시작되면 브라우저에서 재실행해야 합니다. 보존된 다운로드 체크포인트가 있으면 이어받습니다.
+- `/api/health`의 `status: ok`: 앱이 실행 중이라는 뜻입니다. 거래소 접속까지 확인하지는 않습니다.
+- Binance HTTP 403·451: 서버 IP 또는 지역의 접근 제한을 확인합니다. 설정된 Singapore 지역도 접근 성공을 보장하지 않습니다.
+- HTTP 418·429: 화면에 안내된 대기 시간을 확인합니다.
+- `ModuleNotFoundError`: 설치 로그와 Root Directory를 확인합니다.
+- 포트 감지 실패: Start Command의 `--host 0.0.0.0`과 `$PORT`를 확인합니다.
+- 계산 중 서버 종료: 메모리 사용량과 서버 로그를 확인합니다.
 
-이 패키지를 Render에 실제 배포한 상태는 아닙니다. 배포 성공 여부와 해당 서버의 실시간 API 접근은 배포 후 확인해야 합니다.
-
-공식 문서: [FastAPI 배포](https://render.com/docs/deploy-fastapi), [Python 버전](https://render.com/docs/python-version), [무료 서비스 제한](https://render.com/docs/free).
+호스팅 설정의 세부 사항은 [Render의 FastAPI 배포 문서](https://render.com/docs/deploy-fastapi)를 참고하세요.

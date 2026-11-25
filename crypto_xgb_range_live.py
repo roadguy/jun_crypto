@@ -71,6 +71,7 @@ def artifact_is_current(
     artifact: dict[str, Any] | None,
     symbol: str,
     timeframe: str,
+    latest_source_timestamp: Any,
 ) -> bool:
     if artifact is None:
         return False
@@ -83,8 +84,13 @@ def artifact_is_current(
     trained_at = pd.to_datetime(artifact.get("trained_at"), utc=True, errors="coerce")
     if pd.isna(trained_at):
         return False
+    source_timestamp = pd.to_datetime(
+        artifact.get("latest_source_timestamp"), utc=True, errors="coerce"
+    )
+    if pd.isna(source_timestamp) or source_timestamp > pd.to_datetime(latest_source_timestamp, utc=True):
+        return False
     age = pd.Timestamp.now(tz="UTC") - trained_at
-    return age < pd.Timedelta(days=core.timeframe_config(timeframe).retrain_days)
+    return pd.Timedelta(0) <= age < pd.Timedelta(days=core.timeframe_config(timeframe).retrain_days)
 
 
 def fit_live_artifact(
@@ -150,16 +156,22 @@ def get_or_train_artifact(
     latest_source_timestamp: Any,
     force_retrain: bool = False,
 ) -> tuple[dict[str, Any], bool]:
-    artifact = load_artifact(symbol, timeframe)
-    reused = not force_retrain and artifact_is_current(
-        artifact, symbol, timeframe
-    )
-    if not reused:
-        artifact = fit_live_artifact(
-            model_df, symbol, timeframe, latest_source_timestamp
-        )
-        save_artifact(artifact, symbol, timeframe)
-    return artifact, reused
+    paths = live_paths(symbol, timeframe)
+    lock = core.FileLock(str(paths["model"]) + ".lock", timeout=core.MODEL_LOCK_TIMEOUT_SECONDS)
+    try:
+        with lock:
+            artifact = load_artifact(symbol, timeframe)
+            reused = not force_retrain and artifact_is_current(
+                artifact, symbol, timeframe, latest_source_timestamp
+            )
+            if not reused:
+                artifact = fit_live_artifact(
+                    model_df, symbol, timeframe, latest_source_timestamp
+                )
+                save_artifact(artifact, symbol, timeframe)
+            return artifact, reused
+    except core.Timeout as exc:
+        raise RuntimeError("동일한 코인·시간봉의 가격 구간 모델을 다른 프로세스가 학습 중입니다.") from exc
 
 
 def load_quality_summary(symbol: str, timeframe: str) -> dict[str, Any] | None:
@@ -194,14 +206,7 @@ def run_latest_range_prediction(
     raw = core.load_raw_data(symbol, timeframe, refresh=refresh)
     featured = core.add_features(raw)
     model_df = research.make_range_data(featured)
-    latest = (
-        featured.replace([np.inf, -np.inf], np.nan)
-        .dropna(subset=core.FEATURE_COLUMNS)
-        .sort_values("timestamp")
-        .tail(1)
-    )
-    if latest.empty:
-        raise ValueError("분위수 최신 예측에 필요한 피처가 없습니다.")
+    latest = core.latest_feature_row(featured)
 
     latest_timestamp = pd.Timestamp(latest["timestamp"].iloc[0])
     artifact, reused = get_or_train_artifact(

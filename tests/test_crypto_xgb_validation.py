@@ -13,6 +13,7 @@ import pandas as pd
 
 import crypto_xgb_core as core
 import crypto_xgb_validation as validation
+import crypto_xgb_range_research as range_research
 
 
 def prediction_frame(closes, returns, probabilities, threshold=0.56):
@@ -30,6 +31,23 @@ def prediction_frame(closes, returns, probabilities, threshold=0.56):
 
 
 class BacktestAccountingTests(unittest.TestCase):
+    def test_bankruptcy_stops_a_position_before_price_recovery(self):
+        frame = prediction_frame(
+            closes=[100.0, 60.0, 120.0],
+            returns=[-0.40, 1.0, 0.10],
+            probabilities=[0.70, 0.70, 0.70],
+        )
+        result = validation._simulate_fixed_position_strategy(frame, "4h")
+        np.testing.assert_array_equal(result["equity"], [0.0, 0.0, 0.0])
+        np.testing.assert_array_equal(result["position"], [1, 0, 0])
+        self.assertTrue(result["bankrupt"])
+        self.assertEqual(result["trade_returns"].tolist(), [-1.0])
+
+    def test_empty_backtest_has_a_clear_error(self):
+        frame = prediction_frame([], [], [])
+        with self.assertRaisesRegex(ValueError, "예측 기록"):
+            validation._simulate_fixed_position_strategy(frame, "4h")
+
     def test_same_position_is_not_charged_each_bar(self):
         frame = prediction_frame(
             closes=[100.0, 110.0], returns=[0.10, 0.10], probabilities=[0.70, 0.70]
@@ -102,6 +120,35 @@ class FeatureAndSplitTests(unittest.TestCase):
         self.assertGreaterEqual(len(lockbox), 89)
         self.assertLess(development["timestamp"].max(), lockbox["timestamp"].min())
         self.assertEqual(metadata["purge_bars"], core.PURGE_BARS)
+
+    def test_lockbox_cannot_overlap_development_with_short_history(self):
+        frame = pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=500, freq="h", tz="UTC")
+        })
+        with self.assertRaisesRegex(ValueError, "데이터가 부족"):
+            validation.split_development_lockbox(frame, 90)
+
+    def test_range_holdout_cannot_overlap_development_with_short_history(self):
+        frame = pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=500, freq="h", tz="UTC")
+        })
+        design = {
+            "holdout_start": "2025-12-01T00:00:00+00:00",
+            "holdout_end": "2026-02-01T00:00:00+00:00",
+            "timeframe": "1h",
+        }
+        with self.assertRaisesRegex(ValueError, "개발 데이터가 부족"):
+            range_research.split_development_holdout(frame, design)
+
+    def test_invalid_latest_features_do_not_fall_back_to_older_candle(self):
+        featured = core.add_features(self.raw_frame())
+        featured.loc[featured.index[-1], "rsi_14"] = np.nan
+        with self.assertRaisesRegex(ValueError, "최신 종료 캔들"):
+            core.latest_feature_row(featured)
+
+    def test_one_class_calibration_uses_raw_probability(self):
+        calibrators = core.fit_calibrators([1, 1, 1], [0.4, 0.6, 0.8])
+        self.assertEqual(calibrators, {"raw": None})
 
 
 class DiagnosticTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Model A 피처로 다음 1봉 수익률의 조건부 분위수를 연구한다.
 
-기존 ``crypto_xgb_core.py``와 웹사이트는 수정하지 않는다. 방향분류 모델과
-별도로 Q10/Q50/Q90 수익률을 예측하여 예상 하단·중앙·상단 구간을 만든다.
+방향분류 모델과 별도로 Q10/Q50/Q90 수익률을 예측하여
+예상 하단·중앙·상단 구간을 만든다.
 
 검증 원칙
 ---------
@@ -37,7 +37,6 @@ import crypto_xgb_core as core
 
 QUANTILES = np.array([0.10, 0.50, 0.90], dtype=float)
 PURGE_BARS = 1
-MIN_INNER_ROWS = 50
 MIN_OUTER_TRAIN_ROWS = 400
 MIN_TEST_ROWS = 30
 TARGET_INTERVAL_COVERAGE = 0.80
@@ -95,27 +94,8 @@ def make_range_data(featured: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_selection_data(model_df: pd.DataFrame):
-    """내부 선택구간을 시간순 네 부분으로 나누고 각 경계를 purge한다."""
-    n = len(model_df)
-    calibration_start = n - int(n * core.CALIBRATION_RATIO)
-    tune_start = calibration_start - int(n * core.TUNE_RATIO)
-    fit_df = model_df.iloc[: tune_start - PURGE_BARS].copy()
-    tune_df = model_df.iloc[
-        tune_start : calibration_start - PURGE_BARS
-    ].copy()
-    calibration_all = model_df.iloc[calibration_start:].copy()
-    middle = len(calibration_all) // 2
-    calibration_fit = calibration_all.iloc[: middle - PURGE_BARS].copy()
-    calibration_select = calibration_all.iloc[middle:].copy()
-    sizes = {
-        "fit": len(fit_df),
-        "tune": len(tune_df),
-        "calibration_fit": len(calibration_fit),
-        "calibration_select": len(calibration_select),
-    }
-    if min(sizes.values()) < MIN_INNER_ROWS:
-        raise ValueError(f"분위수 모델 내부 학습 구간이 부족합니다: {sizes}")
-    return fit_df, tune_df, calibration_fit, calibration_select
+    """방향 모델과 동일한 시간순 분할 기준을 사용한다."""
+    return core.split_selection_data(model_df)
 
 
 def build_fold_schedule(
@@ -453,7 +433,7 @@ def split_development_holdout(
     holdout_start = pd.to_datetime(design["holdout_start"])
     holdout_end = pd.to_datetime(design["holdout_end"])
     start_index = int(model_df["timestamp"].searchsorted(holdout_start, side="left"))
-    development = model_df.iloc[: start_index - PURGE_BARS].copy()
+    development = model_df.iloc[: max(0, start_index - PURGE_BARS)].copy()
     timeframe_delta = core.timeframe_config(str(design["timeframe"])).delta
     label_end = model_df["timestamp"] + timeframe_delta
     holdout = model_df.loc[
@@ -603,8 +583,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="기존 최종 Holdout 결과를 덮어쓴다. 연구상 권장하지 않는다.",
     )
-    args, _ = parser.parse_known_args()
-    return args
+    return parser.parse_args()
 
 
 def _interactive_selection(args: argparse.Namespace) -> tuple[str, str]:

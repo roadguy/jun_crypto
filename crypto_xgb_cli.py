@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import io
-from contextlib import redirect_stderr, redirect_stdout
 
 import pandas as pd
 
@@ -212,9 +210,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-refresh", action="store_true")
     parser.add_argument("--symbol", help="토큰명 예: BTC, XRP, 1000PEPE")
     parser.add_argument("--timeframe", choices=list(core.TIMEFRAME_CONFIGS))
-    # Jupyter가 자동으로 전달하는 --f=kernel.json 등의 인자는 무시한다.
-    args, _ = parser.parse_known_args()
-    return args
+    parser.add_argument("--validate", action="store_true", help="예측 후 개발구간 Walk-Forward 검증 실행")
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -246,40 +243,31 @@ def main() -> None:
 
     validation_error = None
     try:
-        # 코어에서 출력하는 수집·튜닝 진행 로그와 라이브러리 경고는 숨긴다.
-        # 실행 결과 화면에는 OHLCV 5개와 최신 예측만 표시한다.
-        hidden_output = io.StringIO()
-        with redirect_stdout(hidden_output), redirect_stderr(hidden_output):
-            result = core.run_latest_prediction(
-                symbol=symbol,
-                timeframe=timeframe,
-                refresh=not args.no_refresh,
-                force_retrain=False,
-            )
-            # 위에서 데이터 갱신이 끝났으므로 네트워크 요청 없이 읽는다.
-            raw_df = core.load_raw_data(symbol, timeframe, refresh=False)
-            validation_summary = validation.load_validation_summary(
-                symbol, timeframe
-            )
+        result = core.run_latest_prediction(
+            symbol=symbol,
+            timeframe=timeframe,
+            refresh=not args.no_refresh,
+            force_retrain=False,
+        )
+        raw_df = core.load_raw_data(symbol, timeframe, refresh=False)
+        validation_summary = validation.load_validation_summary(symbol, timeframe)
     except Exception as exc:
         print(f"\n[실행 실패] {exc}")
         return
 
-    if validation_summary is None:
+    if args.validate:
         coin = symbol.split("/")[0]
         timeframe_label = TIMEFRAME_LABELS[timeframe]
         print(
-            f"[{coin} {timeframe_label} 최초 OOS Walk-Forward 검증 중...]\n"
-            "처음 한 번은 시간이 오래 걸릴 수 있습니다."
+            f"[{coin} {timeframe_label} OOS Walk-Forward 검증 중...]\n"
+            "여러 구간을 학습하므로 시간이 오래 걸릴 수 있습니다."
         )
         try:
-            hidden_output = io.StringIO()
-            with redirect_stdout(hidden_output), redirect_stderr(hidden_output):
-                validation_summary = validation.run_walk_forward(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    refresh=False,
-                )
+            validation_summary = validation.run_walk_forward(
+                symbol=symbol,
+                timeframe=timeframe,
+                refresh=False,
+            )
         except Exception as exc:
             validation_error = str(exc)
         # 진행 문구를 지운 뒤 최종 결과만 남긴다.

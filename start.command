@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 if [ ! -x .venv/bin/python ]; then
   selected_python=""
-  for candidate in "${PYTHON_BIN:-python3.12}" python3.11 python3 "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"; do
+  for candidate in "${PYTHON_BIN:-python3.12}" python3.11 python3; do
     if "$candidate" -c 'import sys; assert (3,11) <= sys.version_info[:2] < (3,13)' 2>/dev/null; then
       selected_python="$candidate"
       break

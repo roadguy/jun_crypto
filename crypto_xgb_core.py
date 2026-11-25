@@ -1,7 +1,7 @@
 """범용 암호화폐 XGBoost 예측 엔진.
 
-지원 대상은 Binance USD-M의 BTC/ETH/SOL 무기한 선물과
-15분/1시간/4시간/1일 봉이다. 실제 주문 기능은 포함하지 않는다.
+Binance USD-M의 USDT 무기한 선물 15분/1시간/4시간/1일 봉을 사용한다.
+실제 주문 기능은 포함하지 않는다.
 
 Model A 지표의 1, 3, 10, 12, 14, 20, 50, 200 등 모든 기간은 '일수'가 아니라
 선택한 시간봉의 캔들 개수를 뜻한다. 예를 들어 EMA 200은 15분봉에서는
@@ -10,68 +10,26 @@ Model A 지표의 1, 3, 10, 12, 14, 20, 50, 200 등 모든 기간은 '일수'가
 
 from __future__ import annotations
 
-import json
 import builtins
-from contextvars import ContextVar
+import json
 import os
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import ccxt
-from market_data import BinancePublicData
 import joblib
 import numpy as np
 import pandas as pd
+from filelock import FileLock, Timeout
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
-try:
-    from filelock import FileLock, Timeout
-except ImportError:
-    # macOS/Linux에서는 추가 패키지가 없어도 안전하게 작동하도록 한다.
-    # requirements_web.txt 설치 시에는 검증된 filelock 구현이 우선 사용된다.
-    import fcntl
-
-    class Timeout(Exception):
-        """파일 잠금 대기시간 초과."""
-
-    class FileLock:
-        """filelock 미설치 시 사용하는 최소 POSIX 파일 잠금 구현."""
-
-        def __init__(self, lock_file: str, timeout: float = -1) -> None:
-            self.lock_file = lock_file
-            self.timeout = timeout
-            self._handle = None
-
-        def __enter__(self):
-            Path(self.lock_file).parent.mkdir(parents=True, exist_ok=True)
-            self._handle = open(self.lock_file, "a+", encoding="utf-8")
-            deadline = (
-                None if self.timeout < 0 else time.monotonic() + self.timeout
-            )
-            while True:
-                try:
-                    fcntl.flock(
-                        self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
-                    return self
-                except BlockingIOError as exc:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        self._handle.close()
-                        self._handle = None
-                        raise Timeout(self.lock_file) from exc
-                    time.sleep(0.05)
-
-        def __exit__(self, exc_type, exc_value, traceback) -> None:
-            if self._handle is not None:
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-                self._handle.close()
-                self._handle = None
+from market_data import BinancePublicData, TransientDataError
 
 try:
     from xgboost import XGBClassifier
@@ -355,14 +313,7 @@ def _fetch_page_with_retry(
     timeframe: str,
     since: int,
 ) -> list[list[float]]:
-    """일시적인 네트워크·제한 오류에 지수 백오프로 재시도한다."""
-    transient_errors = (
-        ccxt.RequestTimeout,
-        ccxt.NetworkError,
-        ccxt.ExchangeNotAvailable,
-        ccxt.RateLimitExceeded,
-        ccxt.DDoSProtection,
-    )
+    """일시적인 네트워크·거래소 오류만 지수 백오프로 재시도한다."""
     last_error = None
     for attempt in range(MAX_FETCH_RETRIES):
         try:
@@ -372,7 +323,7 @@ def _fetch_page_with_retry(
                 since=since,
                 limit=LIMIT_PER_CALL,
             )
-        except transient_errors as exc:
+        except TransientDataError as exc:
             last_error = exc
             if attempt == MAX_FETCH_RETRIES - 1:
                 break
@@ -389,19 +340,12 @@ def _fetch_page_with_retry(
 
 def _validate_exchange_market(exchange, symbol: str) -> None:
     """입력 토큰이 현재 거래 가능한 USDT 무기한 선물인지 확인한다."""
-    transient_errors = (
-        ccxt.RequestTimeout,
-        ccxt.NetworkError,
-        ccxt.ExchangeNotAvailable,
-        ccxt.RateLimitExceeded,
-        ccxt.DDoSProtection,
-    )
     last_error = None
     for attempt in range(MAX_FETCH_RETRIES):
         try:
             markets = exchange.load_markets()
             break
-        except transient_errors as exc:
+        except TransientDataError as exc:
             last_error = exc
             if attempt == MAX_FETCH_RETRIES - 1:
                 raise RuntimeError(
@@ -854,6 +798,14 @@ def prepare_data(symbol: str, timeframe: str, refresh: bool = True):
     return raw, featured, model_df
 
 
+def latest_feature_row(featured: pd.DataFrame) -> pd.DataFrame:
+    """최신 봉의 피처가 없으면 과거 봉으로 대체하지 않고 중단한다."""
+    latest = featured.sort_values("timestamp").tail(1)
+    if latest.empty or not np.isfinite(latest[FEATURE_COLUMNS].to_numpy(dtype=float)).all():
+        raise ValueError("최신 종료 캔들의 피처를 계산할 수 없습니다. 데이터와 거래량을 확인하세요.")
+    return latest
+
+
 # ============================================================
 # XGBoost 튜닝과 확률 보정
 # ============================================================
@@ -962,7 +914,9 @@ def _logit(probability) -> np.ndarray:
 def fit_calibrators(y_true, raw_probability) -> dict[str, Any]:
     y = np.asarray(y_true, dtype=int)
     raw = np.asarray(raw_probability, dtype=float)
-    sigmoid = LogisticRegression(C=1e6, l1_ratio=0.0, max_iter=2000)
+    if np.unique(y).size < 2:
+        return {"raw": None}
+    sigmoid = LogisticRegression(C=1e6, max_iter=2000)
     sigmoid.fit(_logit(raw).reshape(-1, 1), y)
     isotonic = IsotonicRegression(out_of_bounds="clip")
     isotonic.fit(raw, y)
@@ -1130,8 +1084,13 @@ def artifact_is_current(artifact: dict | None, latest_timestamp, symbol, timefra
     trained_at = pd.to_datetime(artifact.get("trained_at"), utc=True, errors="coerce")
     if pd.isna(trained_at):
         return False
+    source_timestamp = pd.to_datetime(
+        artifact.get("latest_source_timestamp"), utc=True, errors="coerce"
+    )
+    if pd.isna(source_timestamp) or source_timestamp > pd.to_datetime(latest_timestamp, utc=True):
+        return False
     age = pd.Timestamp.now(tz="UTC") - trained_at
-    return age < pd.Timedelta(days=timeframe_config(timeframe).retrain_days)
+    return pd.Timedelta(0) <= age < pd.Timedelta(days=timeframe_config(timeframe).retrain_days)
 
 
 def get_or_train_artifact(
@@ -1182,6 +1141,7 @@ PAPER_COLUMNS = [
     "probability_up",
     "probability_down",
     "calibration_method",
+    "model_trained_at",
     "threshold",
     "signal",
     "signal_text",
@@ -1260,7 +1220,10 @@ def append_prediction(log_df, latest_row, artifact, config: TimeframeConfig):
     )
     threshold = float(artifact["threshold"])
     signal, signal_text = _signal(probability, threshold)
-    previous_signal = int(log_df.iloc[-1]["signal"]) if not log_df.empty else 0
+    previous = log_df.loc[
+        pd.to_datetime(log_df["target_candle_start"]) < target_start
+    ].sort_values("target_candle_start") if not log_df.empty else log_df
+    previous_signal = int(previous.iloc[-1]["signal"]) if not previous.empty else 0
     turnover = abs(signal - previous_signal)
     fee = LEVERAGE * CAPITAL_FRACTION * ONE_WAY_FEE_RATE * turnover
     row = {column: np.nan for column in PAPER_COLUMNS}
@@ -1276,6 +1239,7 @@ def append_prediction(log_df, latest_row, artifact, config: TimeframeConfig):
             "probability_up": probability,
             "probability_down": 1 - probability,
             "calibration_method": artifact["calibration_method"],
+            "model_trained_at": artifact["trained_at"],
             "threshold": threshold,
             "signal": signal,
             "signal_text": signal_text,
@@ -1283,7 +1247,13 @@ def append_prediction(log_df, latest_row, artifact, config: TimeframeConfig):
             "fee_return": fee,
         }
     )
-    return pd.concat([log_df, pd.DataFrame([row])], ignore_index=True), True
+    new_row = pd.DataFrame([row])
+    if log_df.empty:
+        return new_row, True
+    # 아직 정산되지 않아 비어 있는 열도 수치형으로 유지한다.
+    for column in ["realized_close", "asset_return", "net_strategy_return"]:
+        log_df[column] = pd.to_numeric(log_df[column], errors="coerce")
+    return pd.concat([log_df, new_row], ignore_index=True), True
 
 
 def run_latest_prediction(
@@ -1293,9 +1263,7 @@ def run_latest_prediction(
     force_retrain: bool = False,
 ) -> dict[str, Any]:
     raw, featured, model_df = prepare_data(symbol, timeframe, refresh=refresh)
-    latest = featured.dropna(subset=FEATURE_COLUMNS).sort_values("timestamp").tail(1)
-    if latest.empty:
-        raise ValueError("최신 예측용 피처가 없습니다.")
+    latest = latest_feature_row(featured)
     latest_timestamp = latest["timestamp"].iloc[0]
     artifact, reused = get_or_train_artifact(
         model_df, latest_timestamp, symbol, timeframe, force_retrain=force_retrain
@@ -1315,9 +1283,10 @@ def run_latest_prediction(
                 log_df, latest, artifact, timeframe_config(timeframe)
             )
             _atomic_write_csv(log_df, paths.paper_predictions)
-            latest_log = (
-                log_df.sort_values("target_candle_start").iloc[-1].copy()
-            )
+            target_start = pd.Timestamp(latest_timestamp) + timeframe_config(timeframe).delta
+            latest_log = log_df.loc[
+                pd.to_datetime(log_df["target_candle_start"]) == target_start
+            ].iloc[-1].copy()
     except Timeout as exc:
         raise RuntimeError(
             "동일한 코인·시간봉의 예측 기록을 다른 프로세스가 갱신 중입니다. "
@@ -1336,7 +1305,7 @@ def run_latest_prediction(
         "calibration_method": latest_log["calibration_method"],
         "threshold": float(latest_log["threshold"]),
         "signal": latest_log["signal_text"],
-        "trained_at": artifact["trained_at"],
+        "trained_at": latest_log["model_trained_at"] if pd.notna(latest_log["model_trained_at"]) else None,
         "model_reused": reused,
         "prediction_created": created,
         "paths": paths,

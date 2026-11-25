@@ -544,7 +544,14 @@ def run_lockbox_action(symbol: str, timeframe: str) -> dict[str, Any]:
                 )
                 raw_df = core.load_raw_data(symbol, timeframe, refresh=False)
                 summary = validation.load_validation_summary(symbol, timeframe)
-            status.update(label="최종 미공개 데이터 검증이 완료되었습니다.", state="complete")
+            outdated = lockbox.get("status") == "OUTDATED_DIAGNOSTICS"
+            status.update(
+                label=("구버전 최종 평가 파일을 보존했습니다." if outdated
+                       else "최종 미공개 데이터 검증이 완료되었습니다."),
+                state="complete",
+            )
+            if summary is not None:
+                summary["lockbox"] = lockbox
     except Exception as exc:
         exc.operation_log = log.getvalue()
         raise
@@ -554,6 +561,7 @@ def run_lockbox_action(symbol: str, timeframe: str) -> dict[str, Any]:
         "validation_summary": summary,
         "operation_log": log.getvalue(),
         "notice": (
+            lockbox["warning"] if outdated else
             "최종 미공개 데이터 검증 결과를 확인했습니다. 이 구간을 본 뒤에는 같은 결과로 "
             "피처·하이퍼파라미터·임계값을 다시 선택하면 안 됩니다."
         ),
@@ -905,6 +913,9 @@ def _render_lockbox(summary: dict[str, Any]) -> None:
     lockbox = summary.get("lockbox") or {}
     st.subheader("최종 미공개 데이터 검증")
     status = str(lockbox.get("status", "RESERVED_NOT_EVALUATED"))
+    if status == "OUTDATED_DIAGNOSTICS":
+        st.warning(lockbox["warning"])
+        return
     if status != "EVALUATED_ONCE":
         st.info(
             "가장 최근 90일은 검증용 Holdout으로 분리되어 피처·하이퍼파라미터·"

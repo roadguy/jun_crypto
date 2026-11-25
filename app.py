@@ -1,14 +1,7 @@
-"""FastAPI server for the HTML cryptocurrency research dashboard.
-
-The browser only renders the interface.  Every data/model operation continues
-to use the existing, tested Model A modules.  Long operations run in a single
-background worker and are polled by the browser, which prevents a web request
-from appearing frozen while XGBoost is training.
-"""
+"""예측·검증 작업을 백그라운드에서 실행하는 FastAPI 서버."""
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import threading
@@ -144,23 +137,6 @@ def _read_snapshot(symbol: str, timeframe: str) -> dict[str, Any]:
     if paths.raw_ohlcv.exists():
         raw = core.load_raw_data(symbol, timeframe, refresh=False)
     summary = validation.load_validation_summary(symbol, timeframe)
-    if summary is None:
-        # 포트폴리오 배포 직후에도 이미 완료한 OOS 결과를 보여준다. 이 파일은
-        # 화면 표시용 복사본일 뿐 새 모델의 선택이나 학습에는 사용하지 않는다.
-        seed_summary = (
-            ROOT / "portfolio_results" / core.symbol_slug(symbol)
-            / timeframe / "summary.json"
-        )
-        try:
-            with seed_summary.open(encoding="utf-8") as file:
-                candidate = json.load(file)
-            if (
-                candidate.get("model_version") == core.MODEL_VERSION
-                and candidate.get("feature_columns") == list(core.FEATURE_COLUMNS)
-            ):
-                summary = candidate
-        except (OSError, json.JSONDecodeError):
-            pass
     last_end = (pd.Timestamp(raw["timestamp"].iloc[-1]) + core.timeframe_config(timeframe).delta) if raw is not None and len(raw) else None
     stale = last_end is None or pd.Timestamp.now(tz="UTC") >= last_end + core.timeframe_config(timeframe).delta
     return {
@@ -239,8 +215,13 @@ def _execute_job(job_id: str, request: JobRequest) -> None:
             payload = {
                 **_read_snapshot(symbol, request.timeframe),
                 "lockbox_result": lockbox,
+                "warnings": [lockbox["warning"]] if lockbox.get("warning") else [],
             }
-            message = "최종 미공개 데이터 검증이 완료되었습니다."
+            message = (
+                "구버전 최종 평가 파일을 보존했습니다."
+                if lockbox.get("status") == "OUTDATED_DIAGNOSTICS"
+                else "최종 미공개 데이터 검증이 완료되었습니다."
+            )
 
         payload.update(token=token, symbol=symbol, timeframe=request.timeframe)
         with JOBS_LOCK:
@@ -392,7 +373,12 @@ def start_job(request: JobRequest) -> dict[str, str]:
             "result": None,
             "log": "",
         }
-    EXECUTOR.submit(_execute_job, job_id, request)
+    try:
+        EXECUTOR.submit(_execute_job, job_id, request)
+    except RuntimeError as exc:
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+        raise HTTPException(status_code=503, detail="작업을 시작할 수 없습니다. 잠시 후 다시 시도하세요.") from exc
     return {"job_id": job_id, "status": "queued"}
 
 
